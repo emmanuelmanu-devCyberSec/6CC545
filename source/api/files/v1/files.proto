@@ -1,0 +1,19 @@
+syntax = "proto3";
+package cw1.files.v1;
+option go_package = "example.edu/6cc545/cw1/api/files/v1;filesv1";
+
+// The caller ID is an unverified claim in CW1, NOT authentication.
+message ListFilesRequest { string requester_id = 1; }
+message FileMetadata {
+  string name = 1;
+  int64 size = 2;
+  string sha256 = 3;
+  int64 modified_unix = 4;
+}
+message ListFilesResponse {
+  repeated FileMetadata files = 1;
+  string node_id = 2;
+}
+service FileService {
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+}

@@ -1,0 +1,6 @@
+/bin/
+/evidence/*.tmp
+*.exe
+.DS_Store
+.vscode/
+.idea/

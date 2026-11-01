@@ -1,0 +1,6 @@
+{
+  "id": "node-a",
+  "http_address": "127.0.0.1:8081",
+  "grpc_address": "127.0.0.1:9091",
+  "status": "unknown"
+}
