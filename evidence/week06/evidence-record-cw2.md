@@ -6,13 +6,13 @@
 
 **Week and task:** Week 6, baseline repository and regression checks.
 
-**Immutable tag and full commit hash:** The checks were carried out against the Week 6 working tree. The repository's previous committed baseline was `8a9c05a4c39602feb9435a6a3effe2c76246b68b` (`CW1 final integration: Weeks 1-5 complete`, 1 November 2026). This is the baseline commit, not the Week 6 checkpoint commit.
+**Immutable tag and full commit hash:** week06 — d0ebfa2dd071eb1e6440c7e8340dc498e2f94549
 
-**Date/time and timezone:** 3 November 2026. The environment check was recorded at 11:55:27 (UTC+00:00).
+**Date/time and timezone:** 3 November 2026 — at 11:55:27 (UTC+00:00).
 
 **OS, architecture, go version, CGO_ENABLED, C compiler:** Microsoft Windows 11 Pro, 64-bit, version `10.0.26200`. Go version `go1.27.1 windows/amd64`. `CGO_ENABLED=0`. GCC was not found on the system.
 
-**Docker/Compose versions and image digest where relevant:** Not applicable to these local Go tests. Docker and Docker Compose were not available in the environment.
+**Docker/Compose versions and image digest where relevant:** 
 
 **Exact command and working directory:** Working directory: `C:\Users\n0c71\Desktop\100862618_6CC545_CW1\source`
 
