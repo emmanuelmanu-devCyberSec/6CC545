@@ -137,3 +137,38 @@ Bash: `sh scripts/run-node-a.sh` and, in another terminal, `sh scripts/run-node-
 PowerShell: `./scripts/run-node-a.ps1` and `./scripts/run-node-b.ps1`.
 The scripts rebuild the executable and start it in the foreground. Use Ctrl+C to stop it.
 HTTP addresses: A `127.0.0.1:8081`, B `127.0.0.1:8082`.
+
+# Week 6 student wireframe
+
+## Publish and subscribe events
+
+This is an add-on overlay for your existing CW1 project, not a replacement repository.
+Work in your existing `source/` folder with module `example.edu/6cc545/cw1`.
+Keep all completed earlier work. Read MERGE.md before copying anything.
+
+The `project/` folder contains cumulative starter templates. Assessed behaviour is
+deliberately incomplete at TODOs. Supplied infrastructure compiles when dependencies
+are installed; acceptance tests fail until you implement the contracts. Never submit
+an unimplemented starter as a functioning milestone.
+
+## Run from source
+
+```sh
+go test ./internal/events -count=1
+go test -tags acceptance ./internal/events -count=1 -timeout 30s
+go test -race -tags acceptance ./internal/events -count=1 -timeout 60s
+```
+
+The first command checks allocation/supplied safety scaffolding only. The second and
+third exercise student functions. Run inherited CW1 tests too. For final submission,
+run `go test ./...`, `go test -tags acceptance ./...`, `go test -race -tags acceptance ./...`
+and `go vet ./...` from your integrated project using the supported lab toolchain.
+
+Expected starter outcome: ordinary smoke checks pass; acceptance reports TODO/error
+failures. After implementation, acceptance must pass and the live node evidence must
+also show the required behaviour. Do not delete, skip or weaken tests to turn them green.
+
+Use TASKS.md, docs/cw2-integration.md, docs/evidence-record-cw2.md and the Week 6
+workbook together. Suggested designs may be adapted if the assessment's observable
+requirements remain satisfied and the differences are justified.
+

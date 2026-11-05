@@ -342,3 +342,43 @@ The protocol definitions and behaviours described here are based on the Week 4 i
 - `internal/ipc/failure_test.go`: tests for oversized TCP frames, malformed and oversized UDP datagrams, incomplete TCP frame timeouts and server shutdown.
 
 The maximum encoded payload is 4096 bytes, the text limit is 512 bytes, and the protocol version is `1`, as defined in the source code.
+
+# Event Contract
+
+## 1. Event Structure
+
+For Week 6, the event system uses an `Event` structure with four fields. Each field provides information about what happened, where the event came from and which file was affected.
+
+| Field | Type | Description |
+|---|---|---|
+| `ID` | String | A unique identifier used to distinguish one event from another. |
+| `Kind` | String | Describes the type of event and is used by subscribers to receive events they are interested in. |
+| `Origin` | String | Identifies the node or component that generated the event. |
+| `Name` | String | Contains the name of the file affected by the event. |
+
+## 2. Example Event
+
+The following is an example of an event generated when a file is added:
+
+```json
+{
+  "ID": "event-001",
+  "Kind": "file.added",
+  "Origin": "node-a",
+  "Name": "alpha.txt"
+}
+```
+
+The values are examples to show how the event is structured.
+
+## 3. How Events Work
+
+The `Kind` field helps the event bus decide which subscribers should receive an event. For example, a subscriber interested in `file.added` will receive events with that topic.
+
+The `Name` field identifies the file involved. The event only carries information about what happened; it does not contain the actual file or a complete list of files.
+
+The event bus works within a single Go process. This means its channels are used for communication between components running in that process. Sending events to other nodes is handled separately through the network transport adapter.
+
+For Week 6, a `file.added` event represents successful file metadata registration. It does not mean that the actual file content has been stored. This distinction will be important in Week 7, when the event will be connected to successful content storage.
+
+Finally, when an event is successfully published, it means that it has been accepted into a subscriber's queue. It does not necessarily mean that the subscriber has already received or processed it.

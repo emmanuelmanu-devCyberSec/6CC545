@@ -15,6 +15,39 @@ type Catalog struct {
 }
 
 func NewCatalog() *Catalog { return &Catalog{files: []model.FileMetadata{}} }
+
+// ErrDuplicateFile is returned when a filename already exists in the catalogue.
+var ErrDuplicateFile = errors.New("duplicate filename")
+
+// Add validates and inserts one file metadata record into the catalogue.
+func (c *Catalog) Add(f model.FileMetadata) error {
+	// Validate the metadata before modifying the catalogue.
+	if err := f.Validate(); err != nil {
+		return err
+	}
+
+	// Lock the catalogue to prevent concurrent updates.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Reject duplicate filenames without replacing existing records.
+	for _, existing := range c.files {
+		if existing.Name == f.Name {
+			return ErrDuplicateFile
+		}
+	}
+
+	// Add the validated metadata record.
+	c.files = append(c.files, f)
+
+	// Keep the catalogue sorted by filename.
+	sort.Slice(c.files, func(i, j int) bool {
+		return c.files[i].Name < c.files[j].Name
+	})
+
+	return nil
+}
+
 func (c *Catalog) Replace(input []model.FileMetadata) error {
 	// Copy the input so changes to the caller's slice cannot affect
 	// the catalogue while validation is in progress.

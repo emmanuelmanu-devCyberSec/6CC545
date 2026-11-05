@@ -46,14 +46,55 @@ func Peers(s *state.Registry) http.HandlerFunc {
 		WriteJSON(w, http.StatusCreated, p)
 	}
 }
-func Files(c *state.Catalog) http.HandlerFunc {
+
+func Files(
+	c *state.Catalog,
+	publish func(model.FileMetadata) (string, error),
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			w.Header().Set("Allow", "GET")
-			ErrorJSON(w, 405, "method_not_allowed")
+		// GET returns a snapshot of the catalogue.
+		if r.Method == http.MethodGet {
+			WriteJSON(w, http.StatusOK, c.Snapshot())
 			return
 		}
-		WriteJSON(w, 200, c.Snapshot())
+
+		// Only GET and POST are supported.
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+
+		// Decode and validate the incoming metadata.
+		var file model.FileMetadata
+		if err := DecodeOne(w, r, &file); err != nil {
+			ErrorJSON(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+
+		// Add the metadata without replacing an existing record.
+		if err := c.Add(file); err != nil {
+			if errors.Is(err, state.ErrDuplicateFile) {
+				ErrorJSON(w, http.StatusConflict, "duplicate_filename")
+				return
+			}
+
+			ErrorJSON(w, http.StatusBadRequest, "invalid_file_metadata")
+			return
+		}
+
+		// Publish an event for the newly added metadata.
+		eventID, err := publish(file)
+		if err != nil {
+			ErrorJSON(w, http.StatusServiceUnavailable, "event_publish_failed")
+			return
+		}
+
+		// Return the created metadata and its event ID.
+		WriteJSON(w, http.StatusCreated, map[string]any{
+			"file":     file,
+			"event_id": eventID,
+		})
 	}
 }
 
