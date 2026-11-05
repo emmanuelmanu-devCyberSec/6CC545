@@ -3,35 +3,34 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"sync"
+	"time"
 
+	"example.edu/6cc545/cw1/internal/events"
 	"example.edu/6cc545/cw1/internal/model"
 	"example.edu/6cc545/cw1/internal/state"
+	"example.edu/6cc545/cw1/internal/storage"
 )
 
 func Peers(s *state.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// GET returns a snapshot of the registered peers.
 		if r.Method == http.MethodGet {
 			WriteJSON(w, http.StatusOK, s.Snapshot())
 			return
 		}
 
-		// Only GET and POST are supported.
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "GET, POST")
 			ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
 		}
 
-		// DecodeOne enforces the existing Week 2 JSON request limits
-		// and rejects malformed or oversized request bodies.
 		var p model.Peer
 		if err := DecodeOne(w, r, &p); err != nil {
 			ErrorJSON(w, http.StatusBadRequest, "invalid_request")
 			return
 		}
 
-		// Add validates the peer and rejects duplicate IDs.
 		if err := s.Add(p); err != nil {
 			if errors.Is(err, state.ErrDuplicate) {
 				ErrorJSON(w, http.StatusConflict, "duplicate_peer")
@@ -42,61 +41,155 @@ func Peers(s *state.Registry) http.HandlerFunc {
 			return
 		}
 
-		// Return 201 Created when a new peer is registered.
 		WriteJSON(w, http.StatusCreated, p)
 	}
 }
 
+const multipartOverhead int64 = 1 << 20
+
 func Files(
 	c *state.Catalog,
-	publish func(model.FileMetadata) (string, error),
+	store *storage.Store,
+	maxUploadBytes int64,
+	publish func(model.FileMetadata) (string, events.Delivery, error),
 ) http.HandlerFunc {
+	// Keep catalogue updates together when uploads arrive concurrently.
+	var uploadMu sync.Mutex
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		// GET returns a snapshot of the catalogue.
 		if r.Method == http.MethodGet {
 			WriteJSON(w, http.StatusOK, c.Snapshot())
 			return
 		}
 
-		// Only GET and POST are supported.
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "GET, POST")
 			ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
 			return
 		}
 
-		// Decode and validate the incoming metadata.
-		var file model.FileMetadata
-		if err := DecodeOne(w, r, &file); err != nil {
-			ErrorJSON(w, http.StatusBadRequest, "invalid_request")
+		if maxUploadBytes < 1 {
+			ErrorJSON(w, http.StatusInternalServerError, "storage_not_configured")
 			return
 		}
 
-		// Add the metadata without replacing an existing record.
-		if err := c.Add(file); err != nil {
-			if errors.Is(err, state.ErrDuplicateFile) {
-				ErrorJSON(w, http.StatusConflict, "duplicate_filename")
+		// Bound the complete multipart request, including its form headers.
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+multipartOverhead)
+
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				ErrorJSON(w, http.StatusRequestEntityTooLarge, "upload_too_large")
 				return
 			}
 
-			ErrorJSON(w, http.StatusBadRequest, "invalid_file_metadata")
+			ErrorJSON(w, http.StatusBadRequest, "invalid_upload")
 			return
 		}
 
-		// Publish an event for the newly added metadata.
-		eventID, err := publish(file)
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
+
+		files := r.MultipartForm.File["file"]
+		digests := r.MultipartForm.Value["sha256"]
+
+		if len(files) != 1 || len(digests) != 1 {
+			ErrorJSON(w, http.StatusBadRequest, "file_and_sha256_required")
+			return
+		}
+
+		uploaded := files[0]
+
+		if uploaded.Size > maxUploadBytes {
+			ErrorJSON(w, http.StatusRequestEntityTooLarge, "upload_too_large")
+			return
+		}
+
+		file, err := uploaded.Open()
 		if err != nil {
-			ErrorJSON(w, http.StatusServiceUnavailable, "event_publish_failed")
+			ErrorJSON(w, http.StatusBadRequest, "invalid_upload")
+			return
+		}
+		defer file.Close()
+
+		// Commit the verified file before publishing any event.
+		uploadMu.Lock()
+		defer uploadMu.Unlock()
+
+		stored, err := store.Put(
+			r.Context(),
+			uploaded.Filename,
+			file,
+			uploaded.Size,
+			digests[0],
+		)
+		if err != nil {
+			switch {
+			case errors.Is(err, storage.ErrTooLarge):
+				ErrorJSON(w, http.StatusRequestEntityTooLarge, "upload_too_large")
+			case errors.Is(err, storage.ErrInvalidName),
+				errors.Is(err, storage.ErrIntegrity):
+				ErrorJSON(w, http.StatusBadRequest, "file_verification_failed")
+			default:
+				ErrorJSON(w, http.StatusInternalServerError, "file_storage_failed")
+			}
 			return
 		}
 
-		// Return the created metadata and its event ID.
-		WriteJSON(w, http.StatusCreated, map[string]any{
-			"file":     file,
-			"event_id": eventID,
-		})
+		// Build catalogue metadata from the file that was actually committed.
+		metadata := model.FileMetadata{
+			Name:         stored.Name,
+			Size:         stored.Size,
+			SHA256:       stored.SHA256,
+			ModifiedUnix: time.Now().Unix(),
+		}
+
+		// Replace an existing catalogue entry when the file was updated.
+		current := c.Snapshot()
+		updated := false
+
+		for i := range current {
+			if current[i].Name == metadata.Name {
+				current[i] = metadata
+				updated = true
+				break
+			}
+		}
+
+		if !updated {
+			current = append(current, metadata)
+		}
+
+		if err := c.Replace(current); err != nil {
+			// The file is already committed. Never remove it because
+			// a separate catalogue update failed.
+			WriteJSON(w, http.StatusCreated, map[string]any{
+				"file":            metadata,
+				"catalogue_error": err.Error(),
+				"event_published": false,
+			})
+			return
+		}
+
+		// Only now, after a successful commit, publish file.added.
+		eventID, delivery, publishErr := publish(metadata)
+
+		response := map[string]any{
+			"file":      metadata,
+			"event_id":  eventID,
+			"delivered": delivery.Delivered,
+			"dropped":   delivery.Dropped,
+		}
+
+		if publishErr != nil {
+			// The file remains committed even if the bus is unavailable.
+			response["event_published"] = false
+			response["event_error"] = publishErr.Error()
+		} else {
+			response["event_published"] = true
+		}
+
+		WriteJSON(w, http.StatusCreated, response)
 	}
 }
-
-var _ = errors.Is
-var _ = model.Peer{}
