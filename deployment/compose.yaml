@@ -1,0 +1,66 @@
+# Teaching deployment probe. APP_PACKAGE must become ./cmd/node for CW2-AT3.
+# Ports publish only to host loopback; peer traffic uses the private bridge.
+name: cw2-lab
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      GO_IMAGE: ${GO_IMAGE:-golang:1.27.3-bookworm}
+      APP_PACKAGE: ${APP_PACKAGE:-./cmd/deploycheck}
+  init: true
+  read_only: true
+  tmpfs: [/tmp]
+  networks: [peers]
+  healthcheck:
+    test: [CMD, /app/probe, -url, 'http://127.0.0.1:8080/healthz']
+    interval: 5s
+    timeout: 3s
+    retries: 6
+    start_period: 5s
+  stop_grace_period: 10s
+  restart: 'no'
+services:
+  node-a:
+    <<: *node
+    environment:
+      NODE_ID: node-a
+      HTTP_ADDR: 0.0.0.0:8080
+      GRPC_ADDR: 0.0.0.0:9090
+      HTTP_ADVERTISE: http://node-a:8080
+      GRPC_ADVERTISE: node-a:9090
+      DATA_DIR: /data
+      PEER_SEEDS: node-b:9090
+    ports: ['127.0.0.1:8081:8080']
+    volumes: [data-a:/data]
+  node-b:
+    <<: *node
+    environment:
+      NODE_ID: node-b
+      HTTP_ADDR: 0.0.0.0:8080
+      GRPC_ADDR: 0.0.0.0:9090
+      HTTP_ADVERTISE: http://node-b:8080
+      GRPC_ADVERTISE: node-b:9090
+      DATA_DIR: /data
+      PEER_SEEDS: node-c:9090
+    ports: ['127.0.0.1:8082:8080']
+    volumes: [data-b:/data]
+  node-c:
+    <<: *node
+    environment:
+      NODE_ID: node-c
+      HTTP_ADDR: 0.0.0.0:8080
+      GRPC_ADDR: 0.0.0.0:9090
+      HTTP_ADVERTISE: http://node-c:8080
+      GRPC_ADVERTISE: node-c:9090
+      DATA_DIR: /data
+      PEER_SEEDS: node-a:9090
+    ports: ['127.0.0.1:8083:8080']
+    volumes: [data-c:/data]
+networks:
+  peers:
+    driver: bridge
+volumes:
+  data-a:
+  data-b:
+  data-c:

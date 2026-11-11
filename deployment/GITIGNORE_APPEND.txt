@@ -1,0 +1,6 @@
+# Append these entries to your EXISTING root .gitignore; do not replace it.
+/secrets/
+/.env
+/source/bin/
+/source/*.exe
+**/*.key
