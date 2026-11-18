@@ -15,6 +15,7 @@ type Peer struct {
 	GRPCAddress string `json:"grpc_address"`
 	Status      string `json:"status"`
 }
+
 type FileMetadata struct {
 	Name         string `json:"name"`
 	Size         int64  `json:"size"`
@@ -27,11 +28,13 @@ func (p Peer) Validate() error {
 		return fmt.Errorf("invalid peer ID %q", p.ID)
 	}
 
-	if !config.ValidAddress(p.HTTPAddress) {
+	// These are the addresses other nodes use to contact this peer.
+	// They can contain Docker service names as well as IP addresses.
+	if !config.ValidAdvertisedAddress(p.HTTPAddress) {
 		return errors.New("invalid peer HTTP address")
 	}
 
-	if !config.ValidAddress(p.GRPCAddress) {
+	if !config.ValidAdvertisedAddress(p.GRPCAddress) {
 		return errors.New("invalid peer gRPC address")
 	}
 
@@ -42,6 +45,7 @@ func (p Peer) Validate() error {
 		return fmt.Errorf("invalid peer status %q", p.Status)
 	}
 }
+
 func (f FileMetadata) Validate() error {
 	if f.Name == "" || len(f.Name) > 128 {
 		return errors.New("filename must contain 1 to 128 bytes")
@@ -70,7 +74,3 @@ func (f FileMetadata) Validate() error {
 
 	return nil
 }
-
-var _ = hex.DecodeString
-var _ = strings.ContainsAny
-var _ = config.ValidID

@@ -31,7 +31,10 @@ import (
 // startFileAddedConsumers attaches two independent consumers to file.added events.
 // The counter tracks received metadata events, while the logger records
 // structured diagnostic information without accessing file contents.
-func startFileAddedConsumers(ctx context.Context, bus *events.Bus) (func(), error) {
+func startFileAddedConsumers(
+	ctx context.Context,
+	bus *events.Bus,
+) (func(context.Context) error, error) {
 	counterSub, err := bus.Subscribe("file.added")
 	if err != nil {
 		return nil, err
@@ -94,17 +97,36 @@ func startFileAddedConsumers(ctx context.Context, bus *events.Bus) (func(), erro
 		}
 	}()
 
-	// Stop both consumers and release their subscriptions safely.
-	stop := func() {
+	// Cancel both consumers and release their subscriptions safely.
+	stop := func(shutdownCtx context.Context) error {
 		stopOnce.Do(func() {
 			cancel()
 			counterSub.Cancel()
 			loggerSub.Cancel()
-			wg.Wait()
 		})
+
+		return waitForWorkers(shutdownCtx, &wg)
 	}
 
 	return stop, nil
+}
+
+// waitForWorkers waits for application-owned goroutines until the
+// supplied shutdown context expires.
+func waitForWorkers(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // loadSeed registers the seed metadata and publishes one local event
@@ -115,28 +137,28 @@ func loadSeed(c *state.Catalog, path string, bus *events.Bus, origin string) err
 		return nil
 	}
 
-	f, e := os.Open(path)
-	if e != nil {
-		return e
+	f, err := os.Open(path)
+	if err != nil {
+		return err
 	}
 	defer f.Close()
 
-	b, e := io.ReadAll(io.LimitReader(f, 65537))
-	if e != nil {
-		return e
+	b, err := io.ReadAll(io.LimitReader(f, 65537))
+	if err != nil {
+		return err
 	}
 	if len(b) > 65536 {
 		return errors.New("seed exceeds 64 KiB")
 	}
 
 	var data []model.FileMetadata
-	if e = json.Unmarshal(b, &data); e != nil {
-		return e
+	if err = json.Unmarshal(b, &data); err != nil {
+		return err
 	}
 
 	// Register all metadata before publishing any file.added events.
-	if e = c.Replace(data); e != nil {
-		return e
+	if err = c.Replace(data); err != nil {
+		return err
 	}
 
 	// Publish one metadata event for each successfully registered record.
@@ -148,8 +170,8 @@ func loadSeed(c *state.Catalog, path string, bus *events.Bus, origin string) err
 			Name:   file.Name,
 		}
 
-		if _, e = bus.Publish(event); e != nil {
-			return fmt.Errorf("publish file metadata event: %w", e)
+		if _, err = bus.Publish(event); err != nil {
+			return fmt.Errorf("publish file metadata event: %w", err)
 		}
 	}
 
@@ -159,11 +181,13 @@ func loadSeed(c *state.Catalog, path string, bus *events.Bus, origin string) err
 // forwardFileAdded converts a local file.added event into an IPC notification
 // and sends it to registered peers through their HTTP message endpoints.
 // The event ID and original node ID are preserved in the IPC message.
+// Each peer request is limited by the configured network timeout.
 func forwardFileAdded(
 	ctx context.Context,
 	reg *state.Registry,
 	localID string,
 	event events.Event,
+	timeout time.Duration,
 ) error {
 	message := ipc.Message{
 		Version:   ipc.Version,
@@ -179,6 +203,12 @@ func forwardFileAdded(
 	payload, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("encode peer notification: %w", err)
+	}
+
+	// Use a bounded HTTP client so an unresponsive peer cannot hold
+	// the forwarding worker indefinitely.
+	client := &http.Client{
+		Timeout: timeout,
 	}
 
 	peers := reg.Snapshot()
@@ -215,7 +245,7 @@ func forwardFileAdded(
 
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf(
@@ -268,6 +298,32 @@ func base(
 	reg := state.NewRegistry()
 	cat := state.NewCatalog()
 
+	// Restore committed file metadata from the recovered storage.
+	storedFiles, err := store.Snapshot()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	recoveredFiles := make([]model.FileMetadata, 0, len(storedFiles))
+
+	for _, file := range storedFiles {
+		info, err := os.Stat(filepath.Join(c.DataDir, file.Name))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		recoveredFiles = append(recoveredFiles, model.FileMetadata{
+			Name:         file.Name,
+			Size:         file.Size,
+			SHA256:       file.SHA256,
+			ModifiedUnix: info.ModTime().Unix(),
+		})
+	}
+
+	if err := cat.Replace(recoveredFiles); err != nil {
+		return nil, nil, err
+	}
+
 	mux.HandleFunc("/v1/status", httpapi.StatusResource(state.NewStatus()))
 	mux.HandleFunc("/v1/peers", httpapi.Peers(reg))
 
@@ -308,11 +364,19 @@ func base(
 	return reg, cat, nil
 }
 
-// Socket setup/ownership is supplied; core protocol functions are student work.
-func wireIPC(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), error) {
+// wireIPC starts the node's TCP and UDP services and owns their listeners.
+// Its cleanup function cancels the services, closes their listeners and
+// waits for their goroutines within the supplied shutdown deadline.
+func wireIPC(
+	ctx context.Context,
+	c config.Config,
+	mux *http.ServeMux,
+) (func(context.Context) error, error) {
 	ctx, cancel := context.WithCancel(ctx)
+
 	var wg sync.WaitGroup
 	var closers []io.Closer
+	var closeOnce sync.Once
 
 	inbox := state.NewInbox()
 
@@ -345,49 +409,73 @@ func wireIPC(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), 
 		}
 	})
 
-	cleanup := func() {
+	// Cancel the services and close their listeners before waiting
+	// for their goroutines to finish.
+	cleanup := func(shutdownCtx context.Context) error {
 		cancel()
-		for _, x := range closers {
-			_ = x.Close()
+
+		closeOnce.Do(func() {
+			for _, closer := range closers {
+				_ = closer.Close()
+			}
+		})
+
+		return waitForWorkers(shutdownCtx, &wg)
+	}
+
+	// Use a bounded cleanup context if service startup fails partway through.
+	cleanupAfterSetupError := func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		if err := cleanup(shutdownCtx); err != nil {
+			log.Printf("IPC startup cleanup: %v", err)
 		}
-		wg.Wait()
 	}
 
 	if c.TCP != "" {
-		ln, e := net.Listen("tcp", c.TCP)
-		if e != nil {
-			cleanup()
-			return nil, e
+		ln, err := net.Listen("tcp", c.TCP)
+		if err != nil {
+			cleanupAfterSetupError()
+			return nil, err
 		}
+
 		closers = append(closers, ln)
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if e := ipc.ServeTCP(ctx, ln, c.ID, c.Timeout, inbox.Record); e != nil && ctx.Err() == nil {
-				log.Printf("TCP service stopped: %v", e)
+
+			if err := ipc.ServeTCP(ctx, ln, c.ID, c.Timeout, inbox.Record); err != nil && ctx.Err() == nil {
+				log.Printf("TCP service stopped: %v", err)
 			}
 		}()
 	}
 
 	if c.UDP != "" {
-		a, e := net.ResolveUDPAddr("udp", c.UDP)
-		if e != nil {
-			cleanup()
-			return nil, e
+		addr, err := net.ResolveUDPAddr("udp", c.UDP)
+		if err != nil {
+			cleanupAfterSetupError()
+			return nil, err
 		}
 
-		s, e := net.ListenUDP("udp", a)
-		if e != nil {
-			cleanup()
-			return nil, e
+		conn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			cleanupAfterSetupError()
+			return nil, err
 		}
-		closers = append(closers, s)
+
+		closers = append(closers, conn)
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if e := ipc.ServeUDP(ctx, s, c.ID, c.Timeout, inbox.Record); e != nil && ctx.Err() == nil {
-				log.Printf("UDP service stopped: %v", e)
+
+			if err := ipc.ServeUDP(ctx, conn, c.ID, c.Timeout, inbox.Record); err != nil && ctx.Err() == nil {
+				log.Printf("UDP service stopped: %v", err)
 			}
 		}()
 	}
@@ -397,47 +485,71 @@ func wireIPC(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), 
 
 func CheckStage(c config.Config) error { return nil }
 
-func Wire(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), error) {
+func Wire(
+	ctx context.Context,
+	c config.Config,
+	mux *http.ServeMux,
+) (func(context.Context) error, error) {
 	// Create an event bus with bounded queues for local application events.
-	bus, e := events.New(16)
-	if e != nil {
-		return nil, e
+	bus, err := events.New(16)
+	if err != nil {
+		return nil, err
 	}
 
 	// Start both local consumers before loading the seed metadata.
-	stopConsumers, e := startFileAddedConsumers(ctx, bus)
-	if e != nil {
+	stopConsumers, err := startFileAddedConsumers(ctx, bus)
+	if err != nil {
 		_ = bus.Close()
-		return nil, e
+		return nil, err
 	}
 
-	// Stop consumers before closing the event bus.
-	cleanupEvents := func() {
-		stopConsumers()
-		_ = bus.Close()
-	}
-
-	// Create the local file store.
-	// Each node has its own directory and a maximum upload size of 10 MiB.
+	// Create the local file store using the configured storage directory.
 	const maxUploadBytes int64 = 10 << 20
 
-	store, e := storage.New(
-		filepath.Join("data", c.ID),
-		maxUploadBytes,
-	)
-	if e != nil {
-		cleanupEvents()
-		return nil, fmt.Errorf("create file store: %w", e)
+	store, err := storage.New(c.DataDir, maxUploadBytes)
+	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, fmt.Errorf("create file store: %w", err)
+	}
+
+	// Recover committed files before registering routes or starting services.
+	if err := store.Recover(ctx); err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, fmt.Errorf("recover file store: %w", err)
 	}
 
 	// Create the registry and catalogue and connect the Store to the HTTP route.
-	reg, cat, e := base(c, mux, bus, store, maxUploadBytes)
-	if e != nil {
-		cleanupEvents()
-		return nil, e
+	reg, cat, err := base(c, mux, bus, store, maxUploadBytes)
+	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, err
 	}
 
-	// The application owns the forwarding worker and waits for it at shutdown.
+	// Start the forwarding worker before publishing seed events.
 	forwardCtx, cancelForward := context.WithCancel(ctx)
 	var forwardWG sync.WaitGroup
 
@@ -449,7 +561,13 @@ func Wire(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), err
 			forwardCtx,
 			"file.added",
 			func(sendCtx context.Context, event events.Event) error {
-				return forwardFileAdded(sendCtx, reg, c.ID, event)
+				return forwardFileAdded(
+					sendCtx,
+					reg,
+					c.ID,
+					event,
+					c.Timeout,
+				)
 			},
 		)
 
@@ -458,79 +576,128 @@ func Wire(ctx context.Context, c config.Config, mux *http.ServeMux) (func(), err
 		}
 	}()
 
-	stopForwarder := func() {
+	// Start the IPC services.
+	stopIPC, err := wireIPC(ctx, c, mux)
+	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
 		cancelForward()
-		forwardWG.Wait()
+		_ = waitForWorkers(shutdownCtx, &forwardWG)
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, err
 	}
 
-	// Publish seed events after starting the forwarding worker.
-	if e = loadSeed(cat, c.Seed, bus, c.ID); e != nil {
-		stopForwarder()
-		cleanupEvents()
-		return nil, e
-	}
-
-	stopIPC, e := wireIPC(ctx, c, mux)
-	if e != nil {
-		stopForwarder()
-		cleanupEvents()
-		return nil, e
-	}
-
-	mux.HandleFunc("/v1/remote-files", httpapi.RemoteFiles(reg, c.ID, c.Timeout))
-
-	if c.GRPC == "" {
-		return func() {
-			stopIPC()
-			stopForwarder()
-			cleanupEvents()
-		}, nil
-	}
-
-	ln, e := net.Listen("tcp", c.GRPC)
-	if e != nil {
-		stopIPC()
-		stopForwarder()
-		cleanupEvents()
-		return nil, e
-	}
-
-	s := grpc.NewServer(
-		grpc.MaxRecvMsgSize(4096),
-		grpc.MaxSendMsgSize(65536),
+	mux.HandleFunc(
+		"/v1/remote-files",
+		httpapi.RemoteFiles(reg, c.ID, c.Timeout),
 	)
-	pb.RegisterFileServiceServer(s, &rpcfiles.Service{
-		NodeID:  c.ID,
-		Catalog: cat,
-	})
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if e := s.Serve(ln); e != nil && ctx.Err() == nil {
-			log.Printf("gRPC stopped: %v", e)
+	// Start gRPC only when its listening address is configured.
+	var grpcServer *grpc.Server
+	var grpcDone chan struct{}
+
+	if c.GRPC != "" {
+		ln, listenErr := net.Listen("tcp", c.GRPC)
+		if listenErr != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(
+				context.Background(),
+				c.Timeout,
+			)
+			defer shutdownCancel()
+
+			_ = stopIPC(shutdownCtx)
+			cancelForward()
+			_ = waitForWorkers(shutdownCtx, &forwardWG)
+			_ = stopConsumers(shutdownCtx)
+			_ = bus.Close()
+
+			return nil, listenErr
 		}
-	}()
 
-	return func() {
-		stopped := make(chan struct{})
+		grpcServer = grpc.NewServer(
+			grpc.MaxRecvMsgSize(4096),
+			grpc.MaxSendMsgSize(65536),
+		)
+
+		pb.RegisterFileServiceServer(grpcServer, &rpcfiles.Service{
+			NodeID:  c.ID,
+			Catalog: cat,
+		})
+
+		grpcDone = make(chan struct{})
+
 		go func() {
-			s.GracefulStop()
-			close(stopped)
+			defer close(grpcDone)
+
+			if serveErr := grpcServer.Serve(ln); serveErr != nil && ctx.Err() == nil {
+				log.Printf("gRPC stopped: %v", serveErr)
+			}
 		}()
+	}
 
-		select {
-		case <-stopped:
-		case <-time.After(c.Timeout):
-			s.Stop()
-			<-stopped
-		}
+	var cleanupOnce sync.Once
+	var cleanupErr error
 
-		_ = ln.Close()
-		<-done
+	// Stop all application-owned services and release their resources.
+	cleanup := func(shutdownCtx context.Context) error {
+		cleanupOnce.Do(func() {
+			var errs []error
 
-		stopIPC()
-		stopForwarder()
-		cleanupEvents()
-	}, nil
+			// Stop gRPC gracefully, forcing it to stop if the deadline expires.
+			if grpcServer != nil {
+				stopped := make(chan struct{})
+
+				go func() {
+					grpcServer.GracefulStop()
+					close(stopped)
+				}()
+
+				select {
+				case <-stopped:
+				case <-shutdownCtx.Done():
+					grpcServer.Stop()
+					errs = append(errs, shutdownCtx.Err())
+				}
+
+				// Wait for the gRPC Serve goroutine within the same deadline.
+				select {
+				case <-grpcDone:
+				case <-shutdownCtx.Done():
+					errs = append(errs, shutdownCtx.Err())
+				}
+			}
+
+			// Cancel IPC services, close listeners and wait for their workers.
+			if err := stopIPC(shutdownCtx); err != nil {
+				errs = append(errs, fmt.Errorf("IPC cleanup: %w", err))
+			}
+
+			// Stop peer forwarding before closing the event bus.
+			cancelForward()
+			if err := waitForWorkers(shutdownCtx, &forwardWG); err != nil {
+				errs = append(errs, fmt.Errorf("forwarding cleanup: %w", err))
+			}
+
+			// Stop event consumers before closing the event bus.
+			if err := stopConsumers(shutdownCtx); err != nil {
+				errs = append(errs, fmt.Errorf("event consumer cleanup: %w", err))
+			}
+
+			if err := bus.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("event bus cleanup: %w", err))
+			}
+
+			cleanupErr = errors.Join(errs...)
+		})
+
+		return cleanupErr
+	}
+
+	return cleanup, nil
 }

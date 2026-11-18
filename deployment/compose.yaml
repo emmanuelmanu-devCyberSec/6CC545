@@ -1,65 +1,104 @@
-# Teaching deployment probe. APP_PACKAGE must become ./cmd/node for CW2-AT3.
-# Ports publish only to host loopback; peer traffic uses the private bridge.
+
+# Three-node teaching deployment.
+# APP_PACKAGE is selected through the root .env file.
+# Published HTTP ports are restricted to host loopback.
+# Nodes communicate with each other over the private Docker bridge network.
+
 name: cw2-lab
+
+# Shared configuration used by each node.
 x-node: &node
   build:
-    context: .
-    dockerfile: Dockerfile
+    context: ..
+    dockerfile: deployment/Dockerfile
     args:
       GO_IMAGE: ${GO_IMAGE:-golang:1.27.3-bookworm}
       APP_PACKAGE: ${APP_PACKAGE:-./cmd/deploycheck}
+
   init: true
   read_only: true
   tmpfs: [/tmp]
   networks: [peers]
+
+  # Check whether the node's HTTP health endpoint is responding.
   healthcheck:
     test: [CMD, /app/probe, -url, 'http://127.0.0.1:8080/healthz']
     interval: 5s
     timeout: 3s
     retries: 6
     start_period: 5s
+
   stop_grace_period: 10s
   restart: 'no'
+
 services:
   node-a:
     <<: *node
     environment:
+      # Unique identity for this node.
       NODE_ID: node-a
+      CONTAINER_MODE: "true"
+      # Listening addresses accept connections inside the container.
       HTTP_ADDR: 0.0.0.0:8080
       GRPC_ADDR: 0.0.0.0:9090
-      HTTP_ADVERTISE: http://node-a:8080
+
+      # Advertised addresses are used by other nodes to reach this node.
+      # They contain host and port only, without a URL scheme.
+      HTTP_ADVERTISE: node-a:8080
       GRPC_ADVERTISE: node-a:9090
+
+      # Persistent storage directory inside the container.
       DATA_DIR: /data
+
+      # Initial peer address used for bootstrap configuration.
       PEER_SEEDS: node-b:9090
+
+    # Expose HTTP through the host loopback interface only.
     ports: ['127.0.0.1:8081:8080']
+
+    # Give this node its own persistent storage volume.
     volumes: [data-a:/data]
+
   node-b:
     <<: *node
     environment:
       NODE_ID: node-b
+      CONTAINER_MODE: "true"
       HTTP_ADDR: 0.0.0.0:8080
       GRPC_ADDR: 0.0.0.0:9090
-      HTTP_ADVERTISE: http://node-b:8080
+
+      HTTP_ADVERTISE: node-b:8080
       GRPC_ADVERTISE: node-b:9090
+
       DATA_DIR: /data
       PEER_SEEDS: node-c:9090
+
     ports: ['127.0.0.1:8082:8080']
     volumes: [data-b:/data]
+
   node-c:
     <<: *node
     environment:
       NODE_ID: node-c
+      CONTAINER_MODE: "true"
       HTTP_ADDR: 0.0.0.0:8080
       GRPC_ADDR: 0.0.0.0:9090
-      HTTP_ADVERTISE: http://node-c:8080
+
+      HTTP_ADVERTISE: node-c:8080
       GRPC_ADVERTISE: node-c:9090
+
       DATA_DIR: /data
       PEER_SEEDS: node-a:9090
+
     ports: ['127.0.0.1:8083:8080']
     volumes: [data-c:/data]
+
+# Private network for communication between the three nodes.
 networks:
   peers:
     driver: bridge
+
+# Separate persistent storage for each node.
 volumes:
   data-a:
   data-b:

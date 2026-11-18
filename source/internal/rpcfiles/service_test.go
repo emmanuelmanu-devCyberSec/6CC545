@@ -153,3 +153,65 @@ func TestWeek05_ServiceMapsAllMetadataFields(t *testing.T) {
 		t.Errorf("modified timestamp: want 1700000000, got %d", file.GetModifiedUnix())
 	}
 }
+
+func TestWeek08_PeerUnavailableThenRecovers(t *testing.T) {
+	// Reserve an address, then release it to simulate a peer that is not running.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first request should fail because the peer is unavailable.
+	start := time.Now()
+	_, err = Fetch(context.Background(), addr, "node-a", 250*time.Millisecond)
+	if err == nil {
+		t.Fatal("unavailable peer returned success")
+	}
+	if status.Code(err) != codes.Unavailable &&
+		status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("unexpected status for unavailable peer: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("unavailable peer request exceeded its time bound")
+	}
+
+	// Start the peer at the same address.
+	ln, err = net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := grpc.NewServer()
+	pb.RegisterFileServiceServer(server, &Service{
+		NodeID:  "node-b",
+		Catalog: state.NewCatalog(),
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = server.Serve(ln)
+	}()
+
+	defer func() {
+		server.Stop()
+		_ = ln.Close()
+		<-done
+	}()
+
+	// The next request should succeed after the peer starts.
+	got, err := Fetch(context.Background(), addr, "node-a", 2*time.Second)
+	if err != nil {
+		t.Fatalf("peer did not recover: %v", err)
+	}
+	if got.GetNodeId() != "node-b" {
+		t.Fatalf("node ID: want node-b, got %q", got.GetNodeId())
+	}
+	if len(got.GetFiles()) != 0 {
+		t.Fatalf("empty catalogue: want 0 files, got %d", len(got.GetFiles()))
+	}
+}

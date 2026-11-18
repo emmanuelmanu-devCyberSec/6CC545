@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -310,9 +311,128 @@ func (s *Store) Snapshot() ([]Metadata, error) {
 
 	return snapshot, nil
 }
+
+// Recover rebuilds the in-memory file catalogue from committed files on disk.
+// It also removes abandoned temporary files left by interrupted writes.
 func (s *Store) Recover(ctx context.Context) error {
-	// TODO 8.6: rebuild committed metadata on restart, ignore/remove abandoned
-	// temp files, revalidate names/sizes/hashes; do not follow symlinks. A clear
-	// private-temp naming convention is needed. Never infer validity from name.
-	return ErrNotImplemented
+	if ctx == nil {
+		return errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Protect the catalogue while recovery is in progress.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reject a missing, invalid or symbolic-link storage root.
+	rootInfo, err := os.Lstat(s.root)
+	if err != nil {
+		return err
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("storage root must be a real directory")
+	}
+
+	// Read directory entries without following symbolic links.
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return err
+	}
+
+	// Build a separate catalogue so incomplete recovery cannot replace
+	// the existing catalogue with partially recovered metadata.
+	recovered := make(map[string]Metadata)
+
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		name := entry.Name()
+		path := filepath.Join(s.root, name)
+
+		// Inspect the entry itself rather than following a possible symlink.
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+
+		// Temporary files are not committed data and can be removed safely.
+		if strings.HasPrefix(name, ".w07-tmp-") {
+			if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+				return fmt.Errorf("unexpected temporary entry %q", name)
+			}
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove abandoned temporary file %q: %w", name, err)
+			}
+			continue
+		}
+
+		// Reject symbolic links and unexpected directory entries.
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink not permitted in storage: %q", name)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unexpected storage entry %q", name)
+		}
+
+		// Validate the filename and enforce the configured file-size limit.
+		if err := ValidateName(name); err != nil {
+			return fmt.Errorf("invalid committed filename %q: %w", name, err)
+		}
+		if info.Size() < 0 || info.Size() > s.maxBytes {
+			return fmt.Errorf("invalid committed file size for %q", name)
+		}
+
+		// Open the file and confirm it is still the same regular file
+		// inspected above, rather than a substituted symbolic link.
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		openedInfo, statErr := file.Stat()
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+			_ = file.Close()
+			if statErr != nil {
+				return statErr
+			}
+			return fmt.Errorf("storage entry changed during recovery: %q", name)
+		}
+
+		// Recalculate the file's size and SHA-256 digest from its contents.
+		hasher := sha256.New()
+		size, copyErr := io.Copy(hasher, &contextReader{ctx: ctx, reader: file})
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Confirm the file size remained consistent during recovery.
+		if size != info.Size() || size > s.maxBytes {
+			return fmt.Errorf("committed file size mismatch for %q", name)
+		}
+
+		// Add validated metadata to the catalogue being rebuilt.
+		recovered[name] = Metadata{
+			Name:   name,
+			Size:   size,
+			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Replace the in-memory catalogue only after all entries are recovered.
+	s.files = recovered
+	return nil
 }

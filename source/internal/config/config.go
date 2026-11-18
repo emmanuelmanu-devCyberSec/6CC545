@@ -5,68 +5,243 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Config is process-local. Ports must differ between simultaneously running nodes.
+// Config holds the settings for one running node.
 type Config struct {
-	ID      string
-	HTTP    string
-	TCP     string
-	UDP     string
-	GRPC    string
-	Seed    string
-	Timeout time.Duration
+	ID   string
+	HTTP string
+	TCP  string
+	UDP  string
+	GRPC string
+
+	// Advertised addresses tell other nodes how to reach this node.
+	HTTPAdvertise string
+	GRPCAdvertise string
+
+	// ContainerMode permits wildcard listener addresses inside Docker.
+	// Local mode remains restricted to loopback addresses.
+	ContainerMode bool
+
+	DataDir   string
+	PeerSeeds []string
+	Seed      string
+	Timeout   time.Duration
 }
 
-// Parse is provided infrastructure; students implement Validate.
+// Parse loads configuration using CLI > environment > local defaults.
 func Parse(args []string, out io.Writer) (Config, error) {
 	var c Config
+
+	id := envOrDefault("NODE_ID", "node-a")
+	httpAddr := envOrDefault("HTTP_ADDR", "127.0.0.1:8081")
+	tcpAddr := os.Getenv("TCP_ADDR")
+	udpAddr := os.Getenv("UDP_ADDR")
+	grpcAddr := os.Getenv("GRPC_ADDR")
+
+	httpAdvertise := os.Getenv("HTTP_ADVERTISE")
+	grpcAdvertise := os.Getenv("GRPC_ADVERTISE")
+	dataDir := os.Getenv("DATA_DIR")
+	peerSeeds := os.Getenv("PEER_SEEDS")
+	metadataSeed := os.Getenv("SEED")
+
+	containerMode, err := envBool("CONTAINER_MODE", false)
+	if err != nil {
+		return c, err
+	}
+
+	// Keep the timeout as text until after CLI parsing. This allows an
+	// explicit CLI value to override an invalid environment value.
+	timeoutText := envOrDefault("NETWORK_TIMEOUT", "2s")
+
 	f := flag.NewFlagSet("node", flag.ContinueOnError)
 	f.SetOutput(out)
-	f.StringVar(&c.ID, "id", "node-a", "unique local node ID")
-	f.StringVar(&c.HTTP, "http", "127.0.0.1:8081", "HTTP listen address")
-	f.StringVar(&c.TCP, "tcp", "", "Week 4: TCP address; empty disables")
-	f.StringVar(&c.UDP, "udp", "", "Week 4: UDP address; empty disables")
-	f.StringVar(&c.GRPC, "grpc", "", "Week 5: gRPC address; empty disables")
-	f.StringVar(&c.Seed, "seed", "", "Week 3: synthetic metadata JSON file")
-	f.DurationVar(&c.Timeout, "timeout", 2*time.Second, "network operation timeout")
+
+	f.StringVar(&id, "id", id, "unique local node ID")
+	f.StringVar(&httpAddr, "http", httpAddr, "HTTP listening address")
+	f.StringVar(&tcpAddr, "tcp", tcpAddr, "optional TCP listening address")
+	f.StringVar(&udpAddr, "udp", udpAddr, "optional UDP listening address")
+	f.StringVar(&grpcAddr, "grpc", grpcAddr, "optional gRPC listening address")
+
+	f.StringVar(&httpAdvertise, "http-advertise", httpAdvertise, "HTTP advertised address")
+	f.StringVar(&grpcAdvertise, "grpc-advertise", grpcAdvertise, "gRPC advertised address")
+	f.StringVar(&dataDir, "data-dir", dataDir, "local storage directory")
+	f.StringVar(&peerSeeds, "peer-seeds", peerSeeds, "comma-separated peer addresses")
+	f.StringVar(&metadataSeed, "seed", metadataSeed, "synthetic metadata JSON file")
+
+	f.StringVar(&timeoutText, "timeout", timeoutText, "network operation timeout")
+	f.BoolVar(&containerMode, "container", containerMode, "enable container listener validation")
+
 	if err := f.Parse(args); err != nil {
 		return c, err
 	}
+
 	if len(f.Args()) != 0 {
 		return c, fmt.Errorf("unexpected arguments: %v", f.Args())
 	}
+
+	timeout, err := time.ParseDuration(timeoutText)
+	if err != nil {
+		return c, fmt.Errorf("invalid network timeout %q: %w", timeoutText, err)
+	}
+
+	c.ID = id
+	c.HTTP = httpAddr
+	c.TCP = tcpAddr
+	c.UDP = udpAddr
+	c.GRPC = grpcAddr
+	c.HTTPAdvertise = httpAdvertise
+	c.GRPCAdvertise = grpcAdvertise
+	c.ContainerMode = containerMode
+	c.Seed = metadataSeed
+	c.Timeout = timeout
+
+	if dataDir == "" {
+		dataDir = filepath.Join("data", c.ID)
+	}
+	c.DataDir = dataDir
+	c.PeerSeeds = splitPeerSeeds(peerSeeds)
+
 	return c, c.Validate()
 }
 
-// ValidID and ValidAddress are small supplied helpers, also reused by later models.
-var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
-
-func ValidID(s string) bool { return idPattern.MatchString(s) }
-func ValidAddress(s string) bool {
-	h, p, e := net.SplitHostPort(s)
-	if e != nil || h == "" {
-		return false
+// envOrDefault returns an environment value or its fallback.
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
 	}
-	n, e := strconv.Atoi(p)
-	if e != nil || n < 1 || n > 65535 {
-		return false
-	}
-	// Restrict this teaching scaffold to loopback. This is not authentication.
-	return h == "localhost" || (net.ParseIP(h) != nil && net.ParseIP(h).IsLoopback())
+	return fallback
 }
 
+// envBool reads an optional boolean environment variable.
+func envBool(name string, fallback bool) (bool, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s value %q: %w", name, value, err)
+	}
+	return parsed, nil
+}
+
+// splitPeerSeeds parses a comma-separated list of peer endpoints.
+func splitPeerSeeds(value string) []string {
+	var seeds []string
+	for _, seed := range strings.Split(value, ",") {
+		seed = strings.TrimSpace(seed)
+		if seed != "" {
+			seeds = append(seeds, seed)
+		}
+	}
+	return seeds
+}
+
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
+func ValidID(s string) bool {
+	return idPattern.MatchString(s)
+}
+
+// ValidAddress preserves the original loopback-only address policy.
+func ValidAddress(s string) bool {
+	h, p, err := net.SplitHostPort(s)
+	if err != nil || h == "" {
+		return false
+	}
+
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return false
+	}
+
+	return h == "localhost" ||
+		(net.ParseIP(h) != nil && net.ParseIP(h).IsLoopback())
+}
+
+// ValidListenAddress permits loopback and wildcard listener addresses.
+// Config.Validate only uses this in explicit container mode.
+func ValidListenAddress(s string) bool {
+	h, p, err := net.SplitHostPort(s)
+	if err != nil || h == "" {
+		return false
+	}
+
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return false
+	}
+
+	if h == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(h)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+// ValidAdvertisedAddress validates a peer endpoint's host and port.
+// Wildcard addresses are never valid advertised destinations.
+func ValidAdvertisedAddress(s string) bool {
+	h, p, err := net.SplitHostPort(s)
+	if err != nil || h == "" {
+		return false
+	}
+
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return false
+	}
+
+	if ip := net.ParseIP(h); ip != nil {
+		return !ip.IsUnspecified()
+	}
+
+	if len(h) > 253 {
+		return false
+	}
+
+	for _, label := range strings.Split(h, ".") {
+		if len(label) == 0 || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z') &&
+				!(r >= 'A' && r <= 'Z') &&
+				!(r >= '0' && r <= '9') &&
+				r != '-' {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// Validate checks all configuration before application startup.
 func (c Config) Validate() error {
-	// TODO W01_CONFIG: implement the contract described in TASKS.md.
 	if !ValidID(c.ID) {
 		return fmt.Errorf("invalid node ID %q: use 1-32 letters, numbers, underscores or hyphens", c.ID)
 	}
 
-	if !ValidAddress(c.HTTP) {
-		return fmt.Errorf("invalid HTTP address %q: use a loopback address with a port from 1 to 65535", c.HTTP)
+	// Wildcard listeners are permitted only in explicit container mode.
+	validListener := ValidAddress
+	if c.ContainerMode {
+		validListener = ValidListenAddress
+	}
+
+	if !validListener(c.HTTP) {
+		return fmt.Errorf("invalid HTTP listening address %q", c.HTTP)
 	}
 
 	if c.Timeout <= 0 || c.Timeout > 30*time.Second {
@@ -78,8 +253,27 @@ func (c Config) Validate() error {
 		"UDP":  c.UDP,
 		"gRPC": c.GRPC,
 	} {
-		if address != "" && !ValidAddress(address) {
-			return fmt.Errorf("invalid %s address %q: use a loopback address with a port from 1 to 65535, or leave it empty", name, address)
+		if address != "" && !validListener(address) {
+			return fmt.Errorf("invalid %s listening address %q", name, address)
+		}
+	}
+
+	for name, address := range map[string]string{
+		"HTTP advertised": c.HTTPAdvertise,
+		"gRPC advertised": c.GRPCAdvertise,
+	} {
+		if address != "" && !ValidAdvertisedAddress(address) {
+			return fmt.Errorf("invalid %s address %q", name, address)
+		}
+	}
+
+	if strings.TrimSpace(c.DataDir) == "" {
+		return fmt.Errorf("storage directory cannot be empty")
+	}
+
+	for _, seed := range c.PeerSeeds {
+		if !ValidAdvertisedAddress(seed) {
+			return fmt.Errorf("invalid peer seed address %q", seed)
 		}
 	}
 

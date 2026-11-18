@@ -3,27 +3,38 @@ package main
 import (
 	"context"
 	"errors"
-	"example.edu/6cc545/cw1/internal/app"
-	"example.edu/6cc545/cw1/internal/config"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
+
+	"example.edu/6cc545/cw1/internal/app"
+	"example.edu/6cc545/cw1/internal/config"
 )
 
 func main() {
-	c, e := config.Parse(os.Args[1:], os.Stderr)
-	if errors.Is(e, flag.ErrHelp) {
+	// Parse configuration before starting the application.
+	c, err := config.Parse(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
 		return
 	}
-	if e != nil {
-		log.Printf("configuration: %v", e)
+	if err != nil {
+		log.Printf("configuration: %v", err)
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+
+	// Handle both terminal interrupts and Docker termination signals.
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
-	if e = app.Run(ctx, c); e != nil {
-		log.Printf("node stopped: %v", e)
+
+	// Run the node until it stops or receives a termination signal.
+	if err := app.Run(ctx, c); err != nil {
+		log.Printf("node stopped: %v", err)
 		os.Exit(1)
 	}
 }
