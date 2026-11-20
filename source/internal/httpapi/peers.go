@@ -2,10 +2,15 @@ package httpapi
 
 import (
 	"errors"
+	"io"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"example.edu/6cc545/cw1/internal/config"
 	"example.edu/6cc545/cw1/internal/events"
 	"example.edu/6cc545/cw1/internal/model"
 	"example.edu/6cc545/cw1/internal/state"
@@ -42,6 +47,173 @@ func Peers(s *state.Registry) http.HandlerFunc {
 		}
 
 		WriteJSON(w, http.StatusCreated, p)
+	}
+}
+
+// PeerAnnounce registers a peer using a verified mutual TLS identity.
+func PeerAnnounce(s *state.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+
+		// Require a client certificate verified by the peer HTTPS listener.
+		if r.TLS == nil ||
+			len(r.TLS.VerifiedChains) == 0 ||
+			len(r.TLS.PeerCertificates) == 0 {
+			ErrorJSON(w, http.StatusUnauthorized, "verified_peer_certificate_required")
+			return
+		}
+
+		var p model.Peer
+		if err := DecodeOne(w, r, &p); err != nil {
+			ErrorJSON(w, http.StatusBadRequest, "invalid_request")
+			return
+		}
+
+		// Validate the peer details before comparing the certificate identity.
+		if err := p.Validate(); err != nil {
+			ErrorJSON(w, http.StatusBadRequest, "invalid_peer")
+			return
+		}
+
+		// Secure announcements must advertise an HTTPS peer endpoint.
+		if !config.ValidHTTPSPeerAddress(p.HTTPAddress) {
+			ErrorJSON(w, http.StatusBadRequest, "invalid_secure_peer_address")
+			return
+		}
+
+		// The certificate URI, not the request body, establishes peer identity.
+		expectedIdentity := "spiffe://cw2.local/" + p.ID
+		identityMatches := false
+
+		for _, uri := range r.TLS.PeerCertificates[0].URIs {
+			if uri.String() == expectedIdentity {
+				identityMatches = true
+				break
+			}
+		}
+
+		if !identityMatches {
+			ErrorJSON(w, http.StatusForbidden, "peer_identity_mismatch")
+			return
+		}
+
+		if s == nil {
+			ErrorJSON(w, http.StatusInternalServerError, "peer_registry_unavailable")
+			return
+		}
+
+		if err := s.Add(p); err != nil {
+			if errors.Is(err, state.ErrDuplicate) {
+				ErrorJSON(w, http.StatusConflict, "duplicate_peer")
+				return
+			}
+
+			ErrorJSON(w, http.StatusBadRequest, "invalid_peer")
+			return
+		}
+
+		WriteJSON(w, http.StatusCreated, p)
+	}
+}
+
+// PeerFileTransfer serves a stored file only to a registered, online peer
+// whose verified client certificate contains its matching SPIFFE identity.
+func PeerFileTransfer(
+	registry *state.Registry,
+	store *storage.Store,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+
+		if registry == nil || store == nil {
+			ErrorJSON(w, http.StatusInternalServerError, "peer_transfer_unavailable")
+			return
+		}
+
+		// Require a client certificate verified by the peer HTTPS listener.
+		if r.TLS == nil ||
+			len(r.TLS.VerifiedChains) == 0 ||
+			len(r.TLS.PeerCertificates) == 0 {
+			ErrorJSON(w, http.StatusUnauthorized, "verified_peer_certificate_required")
+			return
+		}
+
+		// Extract the peer ID from its certificate URI SAN.
+		peerID := ""
+
+		for _, uri := range r.TLS.PeerCertificates[0].URIs {
+			if uri.Scheme != "spiffe" || uri.Host != "cw2.local" {
+				continue
+			}
+
+			id := strings.TrimPrefix(uri.Path, "/")
+			if id == "" || strings.Contains(id, "/") {
+				continue
+			}
+
+			peerID = id
+			break
+		}
+
+		if peerID == "" {
+			ErrorJSON(w, http.StatusForbidden, "peer_identity_missing")
+			return
+		}
+
+		// Confirm that the certificate identity belongs to a registered peer.
+		peer, err := registry.Get(peerID)
+		if err != nil {
+			ErrorJSON(w, http.StatusForbidden, "peer_not_registered")
+			return
+		}
+
+		// Only peers currently marked online may retrieve files.
+		if peer.Status != "online" {
+			ErrorJSON(w, http.StatusForbidden, "peer_not_online")
+			return
+		}
+
+		name := r.PathValue("name")
+		if name == "" {
+			ErrorJSON(w, http.StatusBadRequest, "file_name_required")
+			return
+		}
+
+		// Store.Open validates the name and verifies the stored file's size
+		// and digest before returning its content.
+		file, metadata, err := store.Open(name)
+		if err != nil {
+			switch {
+			case errors.Is(err, storage.ErrInvalidName):
+				ErrorJSON(w, http.StatusBadRequest, "invalid_file_name")
+			case errors.Is(err, os.ErrNotExist):
+				ErrorJSON(w, http.StatusNotFound, "file_not_found")
+			default:
+				ErrorJSON(w, http.StatusInternalServerError, "file_unavailable")
+			}
+			return
+		}
+		defer file.Close()
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+		w.Header().Set("X-Content-SHA256", metadata.SHA256)
+		w.Header().Set("X-File-Name", metadata.Name)
+		w.WriteHeader(http.StatusOK)
+
+		if _, err := io.Copy(w, file); err != nil {
+			// The response has started, so an HTTP error response is no
+			// longer possible. The server will terminate the response.
+			return
+		}
 	}
 }
 

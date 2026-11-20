@@ -1,0 +1,134 @@
+﻿name: cw2-secure-lab
+
+x-node-common: &node-common
+  build:
+    context: ..
+    dockerfile: deployment/Dockerfile
+    args:
+      GO_IMAGE: ${GO_IMAGE:-golang:1.27.3-bookworm}
+      APP_PACKAGE: ./cmd/node
+  read_only: true
+  tmpfs:
+    - /tmp
+  restart: "no"
+  stop_grace_period: 10s
+  networks:
+    - peers
+  environment: &common-environment
+    CONTAINER_MODE: "true"
+    HTTP_ADDR: 0.0.0.0:8443
+    GRPC_ADDR: 0.0.0.0:9443
+    PEER_HTTP_ADDR: 0.0.0.0:9444
+    DATA_DIR: /data
+    TLS_CERT_FILE: /run/secrets/server.crt
+    TLS_KEY_FILE: /run/secrets/server.key
+    CA_FILE: /run/secrets/ca.crt
+    JWT_KEY_FILE: /run/secrets/jwt.key
+    JWT_ISSUER: cw2-lab
+    JWT_AUDIENCE: cw2-lab
+    SECURITY_MODE: required
+    NETWORK_TIMEOUT: 2s
+  healthcheck:
+    test:
+      - CMD
+      - /app/probe
+      - -url
+      - https://127.0.0.1:8443/healthz
+      - -ca
+      - /run/secrets/ca.crt
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+
+services:
+  node-a:
+    <<: *node-common
+    ports:
+      - "8441:8443"
+    environment:
+      <<: *common-environment
+      NODE_ID: node-a
+      HTTP_ADVERTISE: node-a:8443
+      GRPC_ADVERTISE: node-a:9443
+      PEER_HTTP_ADVERTISE: https://node-a:9444
+      PEER_SEEDS: https://node-b:9444,https://node-c:9444
+    secrets:
+      - ca.crt
+      - jwt.key
+      - source: node-a-server.crt
+        target: server.crt
+      - source: node-a-server.key
+        target: server.key
+    volumes:
+      - node-a-data:/data
+
+  node-b:
+    <<: *node-common
+    ports:
+      - "8442:8443"
+    environment:
+      <<: *common-environment
+      NODE_ID: node-b
+      HTTP_ADVERTISE: node-b:8443
+      GRPC_ADVERTISE: node-b:9443
+      PEER_HTTP_ADVERTISE: https://node-b:9444
+      PEER_SEEDS: https://node-a:9444,https://node-c:9444
+    secrets:
+      - ca.crt
+      - jwt.key
+      - source: node-b-server.crt
+        target: server.crt
+      - source: node-b-server.key
+        target: server.key
+    volumes:
+      - node-b-data:/data
+
+  node-c:
+    <<: *node-common
+    ports:
+      - "8443:8443"
+    environment:
+      <<: *common-environment
+      NODE_ID: node-c
+      HTTP_ADVERTISE: node-c:8443
+      GRPC_ADVERTISE: node-c:9443
+      PEER_HTTP_ADVERTISE: https://node-c:9444
+      PEER_SEEDS: https://node-a:9444,https://node-b:9444
+    secrets:
+      - ca.crt
+      - jwt.key
+      - source: node-c-server.crt
+        target: server.crt
+      - source: node-c-server.key
+        target: server.key
+    volumes:
+      - node-c-data:/data
+
+secrets:
+  ca.crt:
+    file: ../secrets/ca.crt
+  jwt.key:
+    file: ../secrets/jwt.key
+  node-a-server.crt:
+    file: ../secrets/node-a/server.crt
+  node-a-server.key:
+    file: ../secrets/node-a/server.key
+  node-b-server.crt:
+    file: ../secrets/node-b/server.crt
+  node-b-server.key:
+    file: ../secrets/node-b/server.key
+  node-c-server.crt:
+    file: ../secrets/node-c/server.crt
+  node-c-server.key:
+    file: ../secrets/node-c/server.key
+
+networks:
+  peers:
+    driver: bridge
+    internal: true
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:

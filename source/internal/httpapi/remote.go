@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	pb "example.edu/6cc545/cw1/api/files/v1"
 	"example.edu/6cc545/cw1/internal/config"
 	"example.edu/6cc545/cw1/internal/model"
 	"example.edu/6cc545/cw1/internal/rpcfiles"
@@ -13,7 +14,44 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// RemoteFiles preserves the original teaching client for existing tests.
 func RemoteFiles(reg *state.Registry, nodeID string, timeout time.Duration) http.HandlerFunc {
+	return remoteFiles(reg, nodeID, timeout, func(r *http.Request, address, requester string) (*pb.ListFilesResponse, error) {
+		return rpcfiles.Fetch(r.Context(), address, requester, timeout)
+	})
+}
+
+// RemoteFilesSecure uses mutual TLS for production remote file requests.
+func RemoteFilesSecure(
+	reg *state.Registry,
+	nodeID string,
+	timeout time.Duration,
+	certFile string,
+	keyFile string,
+	caFile string,
+) http.HandlerFunc {
+	return remoteFiles(reg, nodeID, timeout, func(r *http.Request, address, requester string) (*pb.ListFilesResponse, error) {
+		// Use the requested peer ID as the expected TLS server identity.
+		return rpcfiles.FetchSecure(
+			r.Context(),
+			address,
+			requester,
+			timeout,
+			certFile,
+			keyFile,
+			caFile,
+			requester,
+		)
+	})
+}
+
+// remoteFiles contains the shared HTTP handling for secure and legacy requests.
+func remoteFiles(
+	reg *state.Registry,
+	nodeID string,
+	timeout time.Duration,
+	fetch func(*http.Request, string, string) (*pb.ListFilesResponse, error),
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Allow GET requests only.
 		if r.Method != http.MethodGet {
@@ -29,7 +67,7 @@ func RemoteFiles(reg *state.Registry, nodeID string, timeout time.Duration) http
 			return
 		}
 
-		// Look up the peer in reg; return 404 if it is missing.
+		// Look up the peer in the registry; return 404 if it is missing.
 		peer, err := reg.Get(peerID)
 		if err != nil {
 			if errors.Is(err, state.ErrMissing) {
@@ -40,8 +78,8 @@ func RemoteFiles(reg *state.Registry, nodeID string, timeout time.Duration) http
 			return
 		}
 
-		// Invoke rpcfiles.Fetch using the HTTP request context.
-		response, err := rpcfiles.Fetch(r.Context(), peer.GRPCAddress, nodeID, timeout)
+		// Fetch the remote catalogue using the selected secure or legacy client.
+		response, err := fetch(r, peer.GRPCAddress, nodeID)
 		if err != nil {
 			// Map remote gRPC errors to the required HTTP status codes.
 			switch status.Code(err) {
@@ -79,7 +117,7 @@ func RemoteFiles(reg *state.Registry, nodeID string, timeout time.Duration) http
 			})
 		}
 
-		// Return JSON containing the remote node_id and its file metadata.
+		// Return JSON containing the remote node ID and its file metadata.
 		WriteJSON(w, http.StatusOK, struct {
 			NodeID string               `json:"node_id"`
 			Files  []model.FileMetadata `json:"files"`
@@ -89,7 +127,3 @@ func RemoteFiles(reg *state.Registry, nodeID string, timeout time.Duration) http
 		})
 	}
 }
-
-var _ = rpcfiles.Fetch
-var _ = codes.Unavailable
-var _ = status.Code

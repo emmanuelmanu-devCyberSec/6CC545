@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,6 +26,10 @@ type Config struct {
 	HTTPAdvertise string
 	GRPCAdvertise string
 
+	// Secure peer HTTP listener and its advertised HTTPS endpoint.
+	PeerHTTPAddr      string
+	PeerHTTPAdvertise string
+
 	// ContainerMode permits wildcard listener addresses inside Docker.
 	// Local mode remains restricted to loopback addresses.
 	ContainerMode bool
@@ -33,6 +38,15 @@ type Config struct {
 	PeerSeeds []string
 	Seed      string
 	Timeout   time.Duration
+
+	JWTKeyFile  string
+	JWTIssuer   string
+	JWTAudience string
+
+	TLSCertFile  string
+	TLSKeyFile   string
+	CAFile       string
+	SecurityMode string
 }
 
 // Parse loads configuration using CLI > environment > local defaults.
@@ -47,9 +61,21 @@ func Parse(args []string, out io.Writer) (Config, error) {
 
 	httpAdvertise := os.Getenv("HTTP_ADVERTISE")
 	grpcAdvertise := os.Getenv("GRPC_ADVERTISE")
+	peerHTTPAddr := os.Getenv("PEER_HTTP_ADDR")
+	peerHTTPAdvertise := os.Getenv("PEER_HTTP_ADVERTISE")
+
 	dataDir := os.Getenv("DATA_DIR")
 	peerSeeds := os.Getenv("PEER_SEEDS")
 	metadataSeed := os.Getenv("SEED")
+
+	jwtKeyFile := os.Getenv("JWT_KEY_FILE")
+	jwtIssuer := os.Getenv("JWT_ISSUER")
+	jwtAudience := os.Getenv("JWT_AUDIENCE")
+
+	tlsCertFile := os.Getenv("TLS_CERT_FILE")
+	tlsKeyFile := os.Getenv("TLS_KEY_FILE")
+	caFile := os.Getenv("CA_FILE")
+	securityMode := os.Getenv("SECURITY_MODE")
 
 	containerMode, err := envBool("CONTAINER_MODE", false)
 	if err != nil {
@@ -98,9 +124,20 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	c.GRPC = grpcAddr
 	c.HTTPAdvertise = httpAdvertise
 	c.GRPCAdvertise = grpcAdvertise
+	c.PeerHTTPAddr = peerHTTPAddr
+	c.PeerHTTPAdvertise = peerHTTPAdvertise
 	c.ContainerMode = containerMode
 	c.Seed = metadataSeed
 	c.Timeout = timeout
+
+	c.JWTKeyFile = jwtKeyFile
+	c.JWTIssuer = jwtIssuer
+	c.JWTAudience = jwtAudience
+
+	c.TLSCertFile = tlsCertFile
+	c.TLSKeyFile = tlsKeyFile
+	c.CAFile = caFile
+	c.SecurityMode = securityMode
 
 	if dataDir == "" {
 		dataDir = filepath.Join("data", c.ID)
@@ -228,6 +265,21 @@ func ValidAdvertisedAddress(s string) bool {
 	return true
 }
 
+// ValidHTTPSPeerAddress validates an advertised secure peer endpoint.
+func ValidHTTPSPeerAddress(address string) bool {
+	u, err := url.Parse(address)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return false
+	}
+
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/") {
+		return false
+	}
+
+	return ValidAdvertisedAddress(u.Host)
+}
+
 // Validate checks all configuration before application startup.
 func (c Config) Validate() error {
 	if !ValidID(c.ID) {
@@ -271,9 +323,33 @@ func (c Config) Validate() error {
 		return fmt.Errorf("storage directory cannot be empty")
 	}
 
-	for _, seed := range c.PeerSeeds {
-		if !ValidAdvertisedAddress(seed) {
-			return fmt.Errorf("invalid peer seed address %q", seed)
+	if strings.TrimSpace(c.SecurityMode) == "required" {
+		if c.PeerHTTPAddr == "" || !validListener(c.PeerHTTPAddr) {
+			return fmt.Errorf("invalid secure peer HTTP listening address %q", c.PeerHTTPAddr)
+		}
+
+		if !ValidHTTPSPeerAddress(c.PeerHTTPAdvertise) {
+			return fmt.Errorf("invalid secure peer HTTPS advertised address %q", c.PeerHTTPAdvertise)
+		}
+
+		for _, seed := range c.PeerSeeds {
+			if !ValidHTTPSPeerAddress(seed) {
+				return fmt.Errorf("invalid secure peer seed address %q", seed)
+			}
+		}
+	} else {
+		if c.PeerHTTPAddr != "" && !validListener(c.PeerHTTPAddr) {
+			return fmt.Errorf("invalid peer HTTP listening address %q", c.PeerHTTPAddr)
+		}
+
+		if c.PeerHTTPAdvertise != "" && !ValidHTTPSPeerAddress(c.PeerHTTPAdvertise) {
+			return fmt.Errorf("invalid peer HTTPS advertised address %q", c.PeerHTTPAdvertise)
+		}
+
+		for _, seed := range c.PeerSeeds {
+			if !ValidAdvertisedAddress(seed) {
+				return fmt.Errorf("invalid peer seed address %q", seed)
+			}
 		}
 	}
 

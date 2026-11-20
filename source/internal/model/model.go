@@ -28,9 +28,10 @@ func (p Peer) Validate() error {
 		return fmt.Errorf("invalid peer ID %q", p.ID)
 	}
 
-	// These are the addresses other nodes use to contact this peer.
-	// They can contain Docker service names as well as IP addresses.
-	if !config.ValidAdvertisedAddress(p.HTTPAddress) {
+	// Accept legacy host:port addresses and secure HTTPS peer URLs.
+	// This preserves Week 8 compatibility while supporting Week 9 mTLS.
+	if !config.ValidAdvertisedAddress(p.HTTPAddress) &&
+		!config.ValidHTTPSPeerAddress(p.HTTPAddress) {
 		return errors.New("invalid peer HTTP address")
 	}
 

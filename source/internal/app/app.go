@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 
 	"example.edu/6cc545/cw1/internal/config"
 	"example.edu/6cc545/cw1/internal/httpapi"
+	"example.edu/6cc545/cw1/internal/security"
 )
 
 // Run starts the node and owns its HTTP server and application resources.
@@ -26,9 +28,40 @@ func Run(ctx context.Context, c config.Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Exit cleanly if the application context was already cancelled.
 	if ctx.Err() != nil {
 		return nil
+	}
+
+	// Prepare HTTPS before opening the listener when security is required.
+	var httpTLSConfig *tls.Config
+	if c.SecurityMode == "required" {
+		var err error
+		httpTLSConfig, err = security.ServerTLS(
+			c.TLSCertFile,
+			c.TLSKeyFile,
+			c.CAFile,
+			false,
+		)
+		if err != nil {
+			return fmt.Errorf("configure HTTPS: %w", err)
+		}
+	}
+
+	// Bind the HTTP port first so an occupied port is reported
+	// before application components are initialized.
+	ln, err := net.Listen("tcp", c.HTTP)
+	if err != nil {
+		return fmt.Errorf("listen HTTP %s: %w", c.HTTP, err)
+	}
+
+	// Required security mode serves the API through TLS.
+	// The legacy HTTP path is retained only for existing health-only tests.
+	serveListener := ln
+	protocol := "http"
+
+	if httpTLSConfig != nil {
+		serveListener = tls.NewListener(ln, httpTLSConfig)
+		protocol = "https"
 	}
 
 	mux := http.NewServeMux()
@@ -37,28 +70,22 @@ func Run(ctx context.Context, c config.Config) error {
 	})
 	mux.HandleFunc("/healthz", httpapi.Health(c.ID))
 
-	// Wire creates the node's internal services and returns their cleanup function.
-	stop, err := Wire(ctx, c, mux)
-	if err != nil {
-		return err
-	}
+	var stop func(context.Context) error
 
-	ln, err := net.Listen("tcp", c.HTTP)
-	if err != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(
-			context.Background(),
-			c.Timeout,
-		)
-		defer shutdownCancel()
+	if c.JWTKeyFile == "" && c.JWTIssuer == "" && c.JWTAudience == "" {
+		// Legacy lifecycle tests can start the public health endpoint
+		// without enabling the protected application services.
+		log.Printf("node=%s starting in health-only mode: JWT configuration is absent", c.ID)
 
-		if cleanupErr := stop(shutdownCtx); cleanupErr != nil {
-			return errors.Join(
-				fmt.Errorf("listen HTTP %s: %w", c.HTTP, err),
-				fmt.Errorf("application cleanup: %w", cleanupErr),
-			)
+		stop = func(context.Context) error {
+			return nil
 		}
-
-		return fmt.Errorf("listen HTTP %s: %w", c.HTTP, err)
+	} else {
+		stop, err = Wire(ctx, c, mux)
+		if err != nil {
+			_ = ln.Close()
+			return err
+		}
 	}
 
 	srv := &http.Server{
@@ -70,17 +97,11 @@ func Run(ctx context.Context, c config.Config) error {
 	}
 
 	done := make(chan error, 1)
-
-	// Serve runs in its own goroutine so Run can respond to cancellation.
 	go func() {
-		done <- srv.Serve(ln)
+		done <- srv.Serve(serveListener)
 	}()
 
-	log.Printf(
-		"node=%s http=%s ready (loopback teaching service; no authentication)",
-		c.ID,
-		ln.Addr(),
-	)
+	log.Printf("node=%s protocol=%s address=%s ready", c.ID, protocol, ln.Addr())
 
 	var runErr error
 
@@ -89,27 +110,20 @@ func Run(ctx context.Context, c config.Config) error {
 		if !errors.Is(err, http.ErrServerClosed) {
 			runErr = err
 		}
-
 	case <-ctx.Done():
-		// The application context is cancelled, so use a fresh context
-		// to give HTTP requests and the other services time to shut down.
 	}
 
-	// Use one shared deadline for HTTP shutdown and all application cleanup.
 	shutdownCtx, shutdownCancel := context.WithTimeout(
 		context.Background(),
 		c.Timeout,
 	)
 	defer shutdownCancel()
 
-	// Stop accepting new HTTP requests and allow active requests to finish.
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
-		// Force-close remaining connections if graceful shutdown times out.
 		_ = srv.Close()
 	}
 
-	// Wait for the HTTP Serve goroutine to finish without waiting forever.
 	select {
 	case serveErr := <-done:
 		if !errors.Is(serveErr, http.ErrServerClosed) && runErr == nil {
@@ -121,7 +135,6 @@ func Run(ctx context.Context, c config.Config) error {
 		}
 	}
 
-	// Stop internal services using the same shutdown deadline.
 	cleanupErr := stop(shutdownCtx)
 
 	return errors.Join(

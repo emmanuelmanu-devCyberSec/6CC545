@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,9 +25,12 @@ import (
 	"example.edu/6cc545/cw1/internal/ipc"
 	"example.edu/6cc545/cw1/internal/model"
 	"example.edu/6cc545/cw1/internal/rpcfiles"
+	"example.edu/6cc545/cw1/internal/security"
 	"example.edu/6cc545/cw1/internal/state"
 	"example.edu/6cc545/cw1/internal/storage"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // startFileAddedConsumers attaches two independent consumers to file.added events.
@@ -179,15 +184,20 @@ func loadSeed(c *state.Catalog, path string, bus *events.Bus, origin string) err
 }
 
 // forwardFileAdded converts a local file.added event into an IPC notification
-// and sends it to registered peers through their HTTP message endpoints.
+// and sends it to registered peers through their private mTLS HTTPS endpoints.
 // The event ID and original node ID are preserved in the IPC message.
-// Each peer request is limited by the configured network timeout.
 func forwardFileAdded(
 	ctx context.Context,
 	reg *state.Registry,
 	localID string,
 	event events.Event,
 	timeout time.Duration,
+	jwtKey []byte,
+	issuer string,
+	audience string,
+	certFile string,
+	keyFile string,
+	caFile string,
 ) error {
 	message := ipc.Message{
 		Version:   ipc.Version,
@@ -205,10 +215,24 @@ func forwardFileAdded(
 		return fmt.Errorf("encode peer notification: %w", err)
 	}
 
-	// Use a bounded HTTP client so an unresponsive peer cannot hold
-	// the forwarding worker indefinitely.
-	client := &http.Client{
-		Timeout: timeout,
+	// Internal peer notifications use a short-lived writer token.
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"sub":  localID,
+		"role": "writer",
+		"iss":  issuer,
+		"aud":  audience,
+		"iat":  now.Unix(),
+		"nbf":  now.Add(-time.Second).Unix(),
+		"exp":  now.Add(time.Minute).Unix(),
+	}
+
+	peerToken, err := jwt.NewWithClaims(
+		jwt.SigningMethodHS256,
+		claims,
+	).SignedString(jwtKey)
+	if err != nil {
+		return fmt.Errorf("sign peer notification token: %w", err)
 	}
 
 	peers := reg.Snapshot()
@@ -216,15 +240,50 @@ func forwardFileAdded(
 	var firstErr error
 
 	for _, peer := range peers {
-		if peer.ID == localID {
+		if peer.ID == localID || peer.Status == "offline" {
 			continue
 		}
 
-		if peer.Status == "offline" {
+		// Each peer must have an advertised HTTPS endpoint.
+		if !config.ValidHTTPSPeerAddress(peer.HTTPAddress) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf(
+					"peer %s has an invalid HTTPS address",
+					peer.ID,
+				)
+			}
 			continue
 		}
 
-		url := "http://" + peer.HTTPAddress + "/v1/messages"
+		// Verify the peer certificate against our CA and expected node name.
+		tlsConfig, err := security.ClientTLS(
+			certFile,
+			keyFile,
+			caFile,
+			peer.ID,
+		)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf(
+					"configure mTLS for peer %s: %w",
+					peer.ID,
+					err,
+				)
+			}
+			continue
+		}
+
+		transport := &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+
+		client := &http.Client{
+			Transport: transport,
+			Timeout:   timeout,
+		}
+
+		// HTTPAddress already contains the HTTPS scheme and port.
+		url := strings.TrimRight(peer.HTTPAddress, "/") + "/v1/messages"
 
 		req, err := http.NewRequestWithContext(
 			ctx,
@@ -233,6 +292,8 @@ func forwardFileAdded(
 			bytes.NewReader(payload),
 		)
 		if err != nil {
+			transport.CloseIdleConnections()
+
 			if firstErr == nil {
 				firstErr = fmt.Errorf(
 					"create notification request for %s: %w",
@@ -244,9 +305,12 @@ func forwardFileAdded(
 		}
 
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+peerToken)
 
 		resp, err := client.Do(req)
 		if err != nil {
+			transport.CloseIdleConnections()
+
 			if firstErr == nil {
 				firstErr = fmt.Errorf(
 					"send notification to %s: %w",
@@ -259,6 +323,7 @@ func forwardFileAdded(
 
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
+		transport.CloseIdleConnections()
 
 		if resp.StatusCode < http.StatusOK ||
 			resp.StatusCode >= http.StatusMultipleChoices {
@@ -286,14 +351,55 @@ func forwardFileAdded(
 	return firstErr
 }
 
-// base creates the peer registry, catalogue and HTTP endpoints.
-// The Store handles file contents; the catalogue holds committed metadata.
+// base preserves the original five-argument interface used by the
+// existing state tests. Those tests exercise the underlying handlers
+// without requiring JWT authentication.
 func base(
 	c config.Config,
 	mux *http.ServeMux,
 	bus *events.Bus,
 	store *storage.Store,
 	maxUploadBytes int64,
+) (*state.Registry, *state.Catalog, error) {
+	return baseWithSecurity(
+		c,
+		mux,
+		bus,
+		store,
+		maxUploadBytes,
+		nil,
+	)
+}
+
+// baseSecure registers the production routes with JWT authentication.
+func baseSecure(
+	c config.Config,
+	mux *http.ServeMux,
+	bus *events.Bus,
+	store *storage.Store,
+	maxUploadBytes int64,
+	validator security.TokenValidator,
+) (*state.Registry, *state.Catalog, error) {
+	return baseWithSecurity(
+		c,
+		mux,
+		bus,
+		store,
+		maxUploadBytes,
+		&validator,
+	)
+}
+
+// baseWithSecurity creates the peer registry, catalogue and HTTP endpoints.
+// The Store handles file contents; the catalogue holds committed metadata.
+// A nil validator is used only by the original test helper.
+func baseWithSecurity(
+	c config.Config,
+	mux *http.ServeMux,
+	bus *events.Bus,
+	store *storage.Store,
+	maxUploadBytes int64,
+	validator *security.TokenValidator,
 ) (*state.Registry, *state.Catalog, error) {
 	reg := state.NewRegistry()
 	cat := state.NewCatalog()
@@ -324,9 +430,6 @@ func base(
 		return nil, nil, err
 	}
 
-	mux.HandleFunc("/v1/status", httpapi.StatusResource(state.NewStatus()))
-	mux.HandleFunc("/v1/peers", httpapi.Peers(reg))
-
 	// Generate a unique ID for each file event.
 	var fileEventSequence atomic.Uint64
 
@@ -352,25 +455,78 @@ func base(
 		return eventID, delivery, err
 	}
 
+	// Register the status endpoint.
+	statusHandler := httpapi.StatusResource(state.NewStatus())
+
+	if validator == nil {
+		mux.Handle("/v1/status", statusHandler)
+	} else {
+		mux.Handle(
+			"/v1/status",
+			security.Require(*validator, "reader", statusHandler),
+		)
+	}
+
+	// Register the peer registry endpoint.
+	peersHandler := httpapi.Peers(reg)
+
+	if validator == nil {
+		mux.Handle("/v1/peers", peersHandler)
+	} else {
+		mux.Handle(
+			"/v1/peers",
+			security.Require(*validator, "reader", peersHandler),
+		)
+	}
+
 	// POST uploads a file through Store.Put.
 	// GET returns the committed file catalogue.
-	mux.HandleFunc("/v1/files", httpapi.Files(
+	filesHandler := httpapi.Files(
 		cat,
 		store,
 		maxUploadBytes,
 		publishFileEvent,
-	))
+	)
+
+	if validator == nil {
+		// Preserve the original unauthenticated handler for the
+		// existing tests that call base with five arguments.
+		mux.Handle("/v1/files", filesHandler)
+	} else {
+		// Readers may list files, while writers may upload them.
+		readFiles := security.Require(*validator, "reader", filesHandler)
+		writeFiles := security.Require(*validator, "writer", filesHandler)
+
+		mux.Handle(
+			"/v1/files",
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					readFiles.ServeHTTP(w, r)
+
+				case http.MethodPost:
+					writeFiles.ServeHTTP(w, r)
+
+				default:
+					// Preserve the original handler's response for unsupported methods.
+					filesHandler.ServeHTTP(w, r)
+				}
+			}),
+		)
+	}
 
 	return reg, cat, nil
 }
 
 // wireIPC starts the node's TCP and UDP services and owns their listeners.
 // Its cleanup function cancels the services, closes their listeners and
-// waits for their goroutines within the supplied shutdown deadline.
+// waits for their goroutines to finish within the supplied shutdown deadline.
 func wireIPC(
 	ctx context.Context,
 	c config.Config,
 	mux *http.ServeMux,
+	peerMux *http.ServeMux,
+	validator security.TokenValidator,
 ) (func(context.Context) error, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -380,7 +536,8 @@ func wireIPC(
 
 	inbox := state.NewInbox()
 
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+	// Keep the existing message operations behind method-specific permissions.
+	messagesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			httpapi.WriteJSON(w, http.StatusOK, inbox.Snapshot())
@@ -408,6 +565,30 @@ func wireIPC(
 			httpapi.ErrorJSON(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		}
 	})
+
+	// Readers may retrieve messages, while writers may submit new messages.
+	readMessages := security.Require(validator, "reader", messagesHandler)
+	writeMessages := security.Require(validator, "writer", messagesHandler)
+
+	// Both listeners use the same handler and inbox.
+	messageRoute := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			readMessages.ServeHTTP(w, r)
+
+		case http.MethodPost:
+			writeMessages.ServeHTTP(w, r)
+
+		default:
+			messagesHandler.ServeHTTP(w, r)
+		}
+	})
+
+	// Preserve the existing public API endpoint.
+	mux.Handle("/v1/messages", messageRoute)
+
+	// Expose the same JWT-protected endpoint through private peer HTTPS.
+	peerMux.Handle("/v1/messages", messageRoute)
 
 	// Cancel the services and close their listeners before waiting
 	// for their goroutines to finish.
@@ -483,13 +664,92 @@ func wireIPC(
 	return cleanup, nil
 }
 
-func CheckStage(c config.Config) error { return nil }
+// CheckStage validates required security material before the node starts.
+func CheckStage(c config.Config) error {
+	mode := strings.TrimSpace(c.SecurityMode)
+
+	if mode == "" {
+		// Preserve the existing legacy mode for earlier coursework tests.
+		return nil
+	}
+
+	if mode != "required" {
+		return fmt.Errorf("security startup: unsupported SECURITY_MODE")
+	}
+
+	// Required mode must have complete JWT configuration.
+	if strings.TrimSpace(c.JWTKeyFile) == "" ||
+		strings.TrimSpace(c.JWTIssuer) == "" ||
+		strings.TrimSpace(c.JWTAudience) == "" {
+		return fmt.Errorf("security startup: incomplete JWT configuration")
+	}
+
+	jwtKey, err := os.ReadFile(c.JWTKeyFile)
+	if err != nil {
+		return fmt.Errorf("security startup: JWT key file unavailable: %w", err)
+	}
+	if len(jwtKey) < 32 {
+		return fmt.Errorf("security startup: JWT key must contain at least 32 bytes")
+	}
+
+	// Required mode must also have a complete TLS/mTLS configuration.
+	if strings.TrimSpace(c.TLSCertFile) == "" ||
+		strings.TrimSpace(c.TLSKeyFile) == "" ||
+		strings.TrimSpace(c.CAFile) == "" ||
+		strings.TrimSpace(c.GRPC) == "" {
+		return fmt.Errorf("security startup: incomplete TLS/mTLS configuration")
+	}
+
+	// The private peer listener and advertised HTTPS endpoint are mandatory.
+	if strings.TrimSpace(c.PeerHTTPAddr) == "" ||
+		strings.TrimSpace(c.PeerHTTPAdvertise) == "" {
+		return fmt.Errorf("security startup: incomplete peer HTTPS configuration")
+	}
+
+	// Parse the certificate, private key and CA before opening listeners.
+	if _, err := security.ServerTLS(
+		c.TLSCertFile,
+		c.TLSKeyFile,
+		c.CAFile,
+		true,
+	); err != nil {
+		return fmt.Errorf("security startup: TLS material validation failed: %w", err)
+	}
+
+	return nil
+}
 
 func Wire(
 	ctx context.Context,
 	c config.Config,
 	mux *http.ServeMux,
 ) (func(context.Context) error, error) {
+
+	// Load the secret key used to verify incoming JWT signatures.
+	jwtKey, err := os.ReadFile(c.JWTKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load JWT key: %w", err)
+	}
+
+	// Require a sufficiently strong key before accepting signed tokens.
+	if len(jwtKey) < 32 {
+		return nil, fmt.Errorf("JWT key must contain at least 32 bytes")
+	}
+
+	// Ensure tokens are checked against the expected issuer and audience.
+	if strings.TrimSpace(c.JWTIssuer) == "" ||
+		strings.TrimSpace(c.JWTAudience) == "" {
+		return nil, fmt.Errorf("JWT issuer and audience are required")
+	}
+
+	// Configure the validator with the trusted signing key and token settings.
+	validator := security.TokenValidator{
+		Key:      jwtKey,
+		Issuer:   c.JWTIssuer,
+		Audience: c.JWTAudience,
+		NodeID:   c.ID,
+	}
+
 	// Create an event bus with bounded queues for local application events.
 	bus, err := events.New(16)
 	if err != nil {
@@ -535,7 +795,15 @@ func Wire(
 	}
 
 	// Create the registry and catalogue and connect the Store to the HTTP route.
-	reg, cat, err := base(c, mux, bus, store, maxUploadBytes)
+	// Production routes use baseSecure so JWT protection is enabled.
+	reg, cat, err := baseSecure(
+		c,
+		mux,
+		bus,
+		store,
+		maxUploadBytes,
+		validator,
+	)
 	if err != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(
 			context.Background(),
@@ -548,6 +816,9 @@ func Wire(
 
 		return nil, err
 	}
+
+	// Both listeners share the same protected peer message handler.
+	peerMux := http.NewServeMux()
 
 	// Start the forwarding worker before publishing seed events.
 	forwardCtx, cancelForward := context.WithCancel(ctx)
@@ -567,6 +838,12 @@ func Wire(
 					c.ID,
 					event,
 					c.Timeout,
+					jwtKey,
+					c.JWTIssuer,
+					c.JWTAudience,
+					c.TLSCertFile,
+					c.TLSKeyFile,
+					c.CAFile,
 				)
 			},
 		)
@@ -577,7 +854,7 @@ func Wire(
 	}()
 
 	// Start the IPC services.
-	stopIPC, err := wireIPC(ctx, c, mux)
+	stopIPC, err := wireIPC(ctx, c, mux, peerMux, validator)
 	if err != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(
 			context.Background(),
@@ -593,9 +870,22 @@ func Wire(
 		return nil, err
 	}
 
-	mux.HandleFunc(
+	// Only authenticated readers may request remote file metadata.
+	// Protect remote file requests with JWT authorization and mutual TLS.
+	mux.Handle(
 		"/v1/remote-files",
-		httpapi.RemoteFiles(reg, c.ID, c.Timeout),
+		security.Require(
+			validator,
+			"reader",
+			httpapi.RemoteFilesSecure(
+				reg,
+				c.ID,
+				c.Timeout,
+				c.TLSCertFile,
+				c.TLSKeyFile,
+				c.CAFile,
+			),
+		),
 	)
 
 	// Start gRPC only when its listening address is configured.
@@ -603,6 +893,29 @@ func Wire(
 	var grpcDone chan struct{}
 
 	if c.GRPC != "" {
+		// Load the server certificate and require verified client certificates.
+		tlsConfig, tlsErr := security.ServerTLS(
+			c.TLSCertFile,
+			c.TLSKeyFile,
+			c.CAFile,
+			true,
+		)
+		if tlsErr != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(
+				context.Background(),
+				c.Timeout,
+			)
+			defer shutdownCancel()
+
+			_ = stopIPC(shutdownCtx)
+			cancelForward()
+			_ = waitForWorkers(shutdownCtx, &forwardWG)
+			_ = stopConsumers(shutdownCtx)
+			_ = bus.Close()
+
+			return nil, fmt.Errorf("configure gRPC mutual TLS: %w", tlsErr)
+		}
+
 		ln, listenErr := net.Listen("tcp", c.GRPC)
 		if listenErr != nil {
 			shutdownCtx, shutdownCancel := context.WithTimeout(
@@ -621,13 +934,15 @@ func Wire(
 		}
 
 		grpcServer = grpc.NewServer(
+			grpc.Creds(credentials.NewTLS(tlsConfig)),
 			grpc.MaxRecvMsgSize(4096),
 			grpc.MaxSendMsgSize(65536),
 		)
 
 		pb.RegisterFileServiceServer(grpcServer, &rpcfiles.Service{
-			NodeID:  c.ID,
-			Catalog: cat,
+			NodeID:              c.ID,
+			Catalog:             cat,
+			RequirePeerIdentity: true,
 		})
 
 		grpcDone = make(chan struct{})
@@ -641,6 +956,90 @@ func Wire(
 		}()
 	}
 
+	// Configure the private peer HTTPS listener with mandatory client certificates.
+	peerTLSConfig, err := security.ServerTLS(
+		c.TLSCertFile,
+		c.TLSKeyFile,
+		c.CAFile,
+		true,
+	)
+	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		if grpcServer != nil {
+			grpcServer.Stop()
+			<-grpcDone
+		}
+
+		_ = stopIPC(shutdownCtx)
+		cancelForward()
+		_ = waitForWorkers(shutdownCtx, &forwardWG)
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, fmt.Errorf("configure peer HTTPS mutual TLS: %w", err)
+	}
+
+	// The private listener exposes peer-only endpoints.
+	peerMux.HandleFunc(
+		"/v1/peer/announce",
+		httpapi.PeerAnnounce(reg),
+	)
+
+	peerMux.HandleFunc(
+		"/v1/peer/files/{name}",
+		httpapi.PeerFileTransfer(reg, store),
+	)
+	peerHTTPServer := &http.Server{
+		Addr:              c.PeerHTTPAddr,
+		Handler:           peerMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	peerListener, err := net.Listen("tcp", c.PeerHTTPAddr)
+	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(
+			context.Background(),
+			c.Timeout,
+		)
+		defer shutdownCancel()
+
+		if grpcServer != nil {
+			grpcServer.Stop()
+			<-grpcDone
+		}
+
+		_ = stopIPC(shutdownCtx)
+		cancelForward()
+		_ = waitForWorkers(shutdownCtx, &forwardWG)
+		_ = stopConsumers(shutdownCtx)
+		_ = bus.Close()
+
+		return nil, fmt.Errorf("listen peer HTTPS: %w", err)
+	}
+
+	peerHTTPDone := make(chan struct{})
+
+	go func() {
+		defer close(peerHTTPDone)
+
+		if serveErr := peerHTTPServer.Serve(
+			tls.NewListener(peerListener, peerTLSConfig),
+		); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			log.Printf("peer HTTPS service stopped: %v", serveErr)
+		}
+	}()
+
+	log.Printf(
+		"peer_https node=%s address=%s mutual_tls=required",
+		c.ID,
+		c.PeerHTTPAddr,
+	)
+
 	var cleanupOnce sync.Once
 	var cleanupErr error
 
@@ -648,6 +1047,22 @@ func Wire(
 	cleanup := func(shutdownCtx context.Context) error {
 		cleanupOnce.Do(func() {
 			var errs []error
+
+			// Gracefully stop the private peer HTTPS listener.
+			if err := peerHTTPServer.Shutdown(shutdownCtx); err != nil {
+				errs = append(errs, fmt.Errorf("peer HTTPS shutdown: %w", err))
+				_ = peerHTTPServer.Close()
+			}
+
+			// Wait for the peer HTTPS serving goroutine to finish.
+			select {
+			case <-peerHTTPDone:
+			case <-shutdownCtx.Done():
+				errs = append(errs, fmt.Errorf(
+					"peer HTTPS cleanup: %w",
+					shutdownCtx.Err(),
+				))
+			}
 
 			// Stop gRPC gracefully, forcing it to stop if the deadline expires.
 			if grpcServer != nil {
